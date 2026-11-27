@@ -95,6 +95,11 @@ def _isolated_backend(backend: str) -> Iterator[tuple[str, Engine, object]]:
         auth = f"{Config.DB_USER}:{Config.DB_PASSWORD}" if Config.DB_PASSWORD else Config.DB_USER
         url = f"mysql+pymysql://{auth}@{Config.DB_HOST}:{int(Config.DB_PORT)}/{db_name}?charset=utf8mb4"
     elif backend == "localdb":
+        from tests.conftest import check_localdb_support
+        avail, reason = check_localdb_support()
+        if not avail:
+            pytest.skip(f"SQL Server LocalDB unavailable: {reason}")
+
         master = (
             "DRIVER={ODBC Driver 17 for SQL Server};"
             "SERVER=(localdb)\\MSSQLLocalDB;"

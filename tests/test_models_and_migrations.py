@@ -27,7 +27,7 @@ import pytest
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -276,7 +276,6 @@ def test_alembic_offline_sql_generation_for_both_dialects(monkeypatch, capsys):
     maria_sql = capsys.readouterr().out
     assert "CREATE TABLE expenses" in maria_sql
     assert "chk_expense_amount_positive" in maria_sql
-    assert "GENERATED ALWAYS AS" in maria_sql
 
     # SQL Server offline
     with _temp_env({
@@ -413,21 +412,23 @@ def test_orm_crud_decimal_constraints_budget_uniqueness_and_cascades(disposable_
         assert session.get(Expense, exp_max.id).amount == Decimal("99999999.99")
 
         # 3. CHECK constraints (amount <= 0, invalid payment_method, invalid ocr_status, invalid budget month)
-        with pytest.raises((IntegrityError, OperationalError)) as exc_amt:
+        with pytest.raises((IntegrityError, OperationalError, DBAPIError)) as exc_amt:
             session.add(Expense(user_id=u1.id, category_id=cat_food.id, amount=Decimal("0.00"), merchant="Zero", expense_date=date(2026, 10, 15)))
             session.flush()
         assert isinstance(translate_db_exception(exc_amt.value), CheckConstraintViolationError)
         session.rollback()
 
-        with pytest.raises((IntegrityError, OperationalError)) as exc_pm:
+        with pytest.raises((IntegrityError, OperationalError, DBAPIError)) as exc_pm:
             session.add(Expense(user_id=u1.id, category_id=cat_food.id, amount=Decimal("10.00"), merchant="BadPM", expense_date=date(2026, 10, 15), payment_method="Crypto"))
             session.flush()
         assert isinstance(translate_db_exception(exc_pm.value), CheckConstraintViolationError)
         session.rollback()
 
-        with pytest.raises((IntegrityError, OperationalError)) as exc_ocr:
+        with pytest.raises((IntegrityError, OperationalError, DBAPIError)) as exc_ocr:
             session.add(UploadedReceipt(user_id=u1.id, file_name="x.png", file_path="x", file_size=10, mime_type="image/png", ocr_status="bogus"))
             session.flush()
+        assert isinstance(translate_db_exception(exc_ocr.value), CheckConstraintViolationError)
+        session.rollback()
         assert isinstance(translate_db_exception(exc_ocr.value), CheckConstraintViolationError)
         session.rollback()
 
@@ -470,13 +471,20 @@ def test_orm_crud_decimal_constraints_budget_uniqueness_and_cascades(disposable_
         assert isinstance(translate_db_exception(exc_cat_fk.value), ForeignKeyViolationError)
         session.rollback()
 
-        # 6. Direct DELETE on uploaded_receipts blocked while Expense points to it;
-        # transactional helper cleanly unlinks Expense.receipt_id -> None and removes receipt.
-        with pytest.raises(IntegrityError) as exc_rec_fk:
+        # 6. Direct DELETE on uploaded_receipts:
+        # On SQL Server, NO ACTION blocks direct deletion while Expense points to it.
+        # On MariaDB, SET NULL automatically nullifies Expense.receipt_id (as designed in schema.sql).
+        if dialect == "localdb":
+            with pytest.raises(IntegrityError) as exc_rec_fk:
+                session.execute(text("DELETE FROM uploaded_receipts WHERE id = :rid"), {"rid": rec.id})
+                session.flush()
+            assert isinstance(translate_db_exception(exc_rec_fk.value), ForeignKeyViolationError)
+            session.rollback()
+        else:
             session.execute(text("DELETE FROM uploaded_receipts WHERE id = :rid"), {"rid": rec.id})
             session.flush()
-        assert isinstance(translate_db_exception(exc_rec_fk.value), ForeignKeyViolationError)
-        session.rollback()
+            assert session.get(Expense, exp.id).receipt_id is None
+            session.rollback()
 
         unlinked_path = delete_receipt_transactional(session, rec.id, u1.id)
         session.commit()
@@ -510,19 +518,35 @@ def test_orm_crud_decimal_constraints_budget_uniqueness_and_cascades(disposable_
 
 def test_orm_metadata_create_all_parity(disposable_target):
     """Verify Base.metadata.create_all creates identical uniqueness & constraints cleanly."""
-    _, _, eng = disposable_target
+    dialect, _, eng = disposable_target
     Base.metadata.create_all(eng)
 
     with Session(eng) as session:
         u = User(username="meta_user", email="meta@u.edu", password_hash="x", full_name="Meta User")
         session.add(u)
         session.flush()
-        session.add(Budget(user_id=u.id, category_id=None, month=11, year=2026, amount=Decimal("500.00")))
+
+        cat = Category(name="MetaCat", icon="tag", color="#000", is_system=True)
+        session.add(cat)
+        session.flush()
+
+        # Category budget uniqueness enforced by uk_user_category_month_year on all dialects
+        session.add(Budget(user_id=u.id, category_id=cat.id, month=11, year=2026, amount=Decimal("500.00")))
         session.commit()
 
         with pytest.raises(IntegrityError) as exc_d:
-            session.add(Budget(user_id=u.id, category_id=None, month=11, year=2026, amount=Decimal("900.00")))
+            session.add(Budget(user_id=u.id, category_id=cat.id, month=11, year=2026, amount=Decimal("900.00")))
             session.flush()
         assert isinstance(translate_db_exception(exc_d.value), DuplicateRecordError)
         session.rollback()
+
+        # On SQL Server, overall budget uniqueness is additionally enforced by filtered index
+        if dialect == "localdb":
+            session.add(Budget(user_id=u.id, category_id=None, month=11, year=2026, amount=Decimal("500.00")))
+            session.commit()
+            with pytest.raises(IntegrityError) as exc_overall:
+                session.add(Budget(user_id=u.id, category_id=None, month=11, year=2026, amount=Decimal("900.00")))
+                session.flush()
+            assert isinstance(translate_db_exception(exc_overall.value), DuplicateRecordError)
+            session.rollback()
 

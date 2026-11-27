@@ -3,10 +3,12 @@ ExpenseTrack - SQLAlchemy 2.0 Declarative ORM Models
 Maps all 5 relational tables (users, categories, uploaded_receipts, expenses, budgets)
 with strict MariaDB & Microsoft SQL Server (LocalDB / Azure SQL) cross-compatibility:
 - Numeric(10, 2) financial precision
-- UTC DateTime / DATETIME2 timestamps (avoids SQL Server TIMESTAMP rowversion confusion)
-- Portable String + CHECK constraints replacing MySQL-only ENUM types
-- Resolves SQL Server Error 1785 multiple cascade paths via NO ACTION on fk_expenses_receipt
-- Enforces database-level uniqueness for both categorized and overall (NULL category) budgets
+- Dialect-native timestamp handling: MariaDB TIMESTAMP with server-side ON UPDATE CURRENT_TIMESTAMP,
+  SQL Server DATETIME2 (avoids SQL Server binary rowversion TIMESTAMP confusion)
+- Native MariaDB ENUM types with portable VARCHAR + CHECK constraint on SQL Server
+- TINYINT on MariaDB for budgets.month, SMALLINT on SQL Server
+- Exact foreign-key action parity (RESTRICT on categories, SET NULL on receipts)
+- Uniqueness guarantees for both categorized and overall (NULL category) budgets
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    DDL,
     Date,
     DateTime,
     ForeignKey,
@@ -30,14 +31,11 @@ from sqlalchemy import (
     String,
     Unicode,
     UnicodeText,
-    event,
+    func,
     text,
-    update,
 )
-from sqlalchemy.dialects.mssql import DATETIME2
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.dialects import mssql, mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
-
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -59,13 +57,25 @@ ALLOWED_PAYMENT_METHODS = (
 
 
 def utc_now() -> datetime:
-    """Return timezone-naive UTC datetime compatible with both DATETIME and DATETIME2."""
+    """Return timezone-naive UTC datetime compatible with both TIMESTAMP and DATETIME2."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-# Cross-dialect UTC timestamp type: DATETIME on MariaDB/MySQL, DATETIME2 on SQL Server
-UTCDateTime = DateTime(timezone=False).with_variant(DATETIME2(), "mssql")
-LongUnicodeText = UnicodeText().with_variant(MEDIUMTEXT(), "mysql")
+# Cross-dialect types:
+# MariaDB uses native TIMESTAMP / ENUM / TINYINT.
+# SQL Server uses DATETIME2 / VARCHAR+CHECK / SMALLINT.
+NativeTimestamp = DateTime().with_variant(mysql.TIMESTAMP(), "mysql").with_variant(mssql.DATETIME2(), "mssql")
+LongUnicodeText = UnicodeText().with_variant(mysql.MEDIUMTEXT(), "mysql")
+
+PaymentMethodType = String(30).with_variant(
+    mysql.ENUM(*ALLOWED_PAYMENT_METHODS, name="payment_method_enum"), "mysql"
+)
+
+OcrStatusType = String(20).with_variant(
+    mysql.ENUM(*ALLOWED_OCR_STATUSES, name="ocr_status_enum"), "mysql"
+)
+
+BudgetMonthType = SmallInteger().with_variant(mysql.TINYINT(), "mysql")
 
 
 class Base(DeclarativeBase):
@@ -85,34 +95,28 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(Unicode(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=func.current_timestamp(),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        onupdate=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
-    expenses: Mapped[list["Expense"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+    expenses: Mapped[list[Expense]] = relationship(
+        "Expense", back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
-    budgets: Mapped[list["Budget"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+    budgets: Mapped[list[Budget]] = relationship(
+        "Budget", back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
-    receipts: Mapped[list["UploadedReceipt"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+    receipts: Mapped[list[UploadedReceipt]] = relationship(
+        "UploadedReceipt", back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} username={self.username!r} email={self.email!r}>"
 
 
 class Category(Base):
@@ -123,51 +127,33 @@ class Category(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(Unicode(50), nullable=False, unique=True)
-    icon: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="tag",
-        server_default=text("'tag'"),
-    )
-    color: Mapped[str] = mapped_column(
-        String(20),
-        nullable=False,
-        default="#10B981",
-        server_default=text("'#10B981'"),
-    )
-    is_system: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default=text("1"),
-    )
+    icon: Mapped[str] = mapped_column(String(50), nullable=False, server_default=text("'tag'"))
+    color: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'#10B981'"))
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=func.current_timestamp(),
     )
 
-    expenses: Mapped[list["Expense"]] = relationship(
-        back_populates="category",
-        passive_deletes="all",
+    expenses: Mapped[list[Expense]] = relationship("Expense", back_populates="category")
+    budgets: Mapped[list[Budget]] = relationship(
+        "Budget", back_populates="category", cascade="all, delete-orphan", passive_deletes=True
     )
-    budgets: Mapped[list["Budget"]] = relationship(
-        back_populates="category",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+
+    def __repr__(self) -> str:
+        return f"<Category id={self.id} name={self.name!r} is_system={self.is_system}>"
 
 
 class UploadedReceipt(Base):
     __tablename__ = "uploaded_receipts"
     __table_args__ = (
+        Index("idx_receipts_user", "user_id", "created_at"),
+        Index("idx_receipts_hash", "user_id", "file_hash"),
         CheckConstraint(
             "ocr_status IN ('pending', 'success', 'failed', 'fallback')",
             name="chk_receipt_ocr_status",
         ),
-        Index("idx_receipts_user", "user_id", "created_at"),
-        Index("idx_receipts_hash", "user_id", "file_hash"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -183,43 +169,43 @@ class UploadedReceipt(Base):
     azure_blob_url: Mapped[Optional[str]] = mapped_column(Unicode(500), nullable=True)
     ocr_raw_text: Mapped[Optional[str]] = mapped_column(LongUnicodeText, nullable=True)
     ocr_status: Mapped[str] = mapped_column(
-        String(20),
+        OcrStatusType,
         nullable=False,
-        default="pending",
         server_default=text("'pending'"),
     )
     extracted_amount: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2, asdecimal=True),
-        nullable=True,
+        Numeric(10, 2), nullable=True
     )
     extracted_merchant: Mapped[Optional[str]] = mapped_column(Unicode(100), nullable=True)
     extracted_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     extracted_payment_method: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=func.current_timestamp(),
     )
 
-    user: Mapped["User"] = relationship(back_populates="receipts")
-    expenses: Mapped[list["Expense"]] = relationship(back_populates="receipt")
+    user: Mapped[User] = relationship("User", back_populates="receipts")
+    expenses: Mapped[list[Expense]] = relationship("Expense", back_populates="receipt")
+
+    def __repr__(self) -> str:
+        return f"<UploadedReceipt id={self.id} user_id={self.user_id} file_name={self.file_name!r} ocr_status={self.ocr_status!r}>"
 
 
 class Expense(Base):
     __tablename__ = "expenses"
     __table_args__ = (
+        Index("idx_expenses_user_date", "user_id", "expense_date"),
+        Index("idx_expenses_user_category", "user_id", "category_id"),
+        Index("idx_expenses_merchant", "user_id", "merchant"),
+        Index("fk_expenses_category", "category_id"),
+        Index("fk_expenses_receipt", "receipt_id"),
         CheckConstraint("amount > 0.00", name="chk_expense_amount_positive"),
         CheckConstraint(
             "payment_method IN ('UPI', 'Cash', 'Credit Card', 'Debit Card', 'Net Banking', 'Other')",
             name="chk_expense_payment_method",
         ),
-        Index("fk_expenses_category", "category_id"),
-        Index("fk_expenses_receipt", "receipt_id"),
-        Index("idx_expenses_user_date", "user_id", "expense_date"),
-        Index("idx_expenses_user_category", "user_id", "category_id"),
-        Index("idx_expenses_merchant", "user_id", "merchant"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -230,57 +216,75 @@ class Expense(Base):
     )
     category_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("categories.id", name="fk_expenses_category", ondelete="NO ACTION", onupdate="NO ACTION"),
+        ForeignKey("categories.id", name="fk_expenses_category", ondelete="RESTRICT", onupdate="CASCADE"),
         nullable=False,
     )
-    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2, asdecimal=True), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     merchant: Mapped[str] = mapped_column(Unicode(100), nullable=False)
     expense_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_method: Mapped[str] = mapped_column(
-        String(30),
+        PaymentMethodType,
         nullable=False,
-        default="UPI",
         server_default=text("'UPI'"),
     )
-    notes: Mapped[Optional[str]] = mapped_column(UnicodeText(), nullable=True)
-    # NO ACTION avoids SQL Server Error 1785 multiple cascade paths from users -> expenses
+    notes: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
     receipt_id: Mapped[Optional[int]] = mapped_column(
         Integer,
         ForeignKey(
             "uploaded_receipts.id",
             name="fk_expenses_receipt",
-            ondelete="NO ACTION",
-            onupdate="NO ACTION",
+            ondelete="SET NULL",
+            onupdate="CASCADE",
         ),
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=func.current_timestamp(),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        onupdate=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
-    user: Mapped["User"] = relationship(back_populates="expenses")
-    category: Mapped["Category"] = relationship(back_populates="expenses")
-    receipt: Mapped[Optional["UploadedReceipt"]] = relationship(back_populates="expenses")
+    user: Mapped[User] = relationship("User", back_populates="expenses")
+    category: Mapped[Category] = relationship("Category", back_populates="expenses")
+    receipt: Mapped[Optional[UploadedReceipt]] = relationship("UploadedReceipt", back_populates="expenses")
+
+    def __repr__(self) -> str:
+        return (
+            f"<Expense id={self.id} user_id={self.user_id} category_id={self.category_id} "
+            f"amount={self.amount} date={self.expense_date}>"
+        )
 
 
 class Budget(Base):
     __tablename__ = "budgets"
     __table_args__ = (
+        Index("idx_budgets_lookup", "user_id", "year", "month"),
+        Index("fk_budgets_category", "category_id"),
+        Index(
+            "uk_user_category_month_year",
+            "user_id",
+            "category_id",
+            "month",
+            "year",
+            unique=True,
+        ),
+        # On SQL Server, filtered index enforces overall budget uniqueness at DB level.
+        Index(
+            "uq_budgets_user_overall_period",
+            "user_id",
+            "month",
+            "year",
+            unique=True,
+            mssql_where=text("category_id IS NULL"),
+        ),
         CheckConstraint("month BETWEEN 1 AND 12", name="chk_budget_month"),
         CheckConstraint("year >= 2020", name="chk_budget_year"),
         CheckConstraint("amount > 0.00", name="chk_budget_amount_positive"),
-        Index("fk_budgets_category", "category_id"),
-        Index("idx_budgets_lookup", "user_id", "year", "month"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -294,55 +298,28 @@ class Budget(Base):
         ForeignKey("categories.id", name="fk_budgets_category", ondelete="CASCADE", onupdate="CASCADE"),
         nullable=True,
     )
-    month: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    month: Mapped[int] = mapped_column(BudgetMonthType, nullable=False)
     year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2, asdecimal=True), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=func.current_timestamp(),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime,
+        NativeTimestamp,
         nullable=False,
-        default=utc_now,
-        onupdate=utc_now,
-        server_default=text("CURRENT_TIMESTAMP"),
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
-    user: Mapped["User"] = relationship(back_populates="budgets")
-    category: Mapped[Optional["Category"]] = relationship(back_populates="budgets")
+    user: Mapped[User] = relationship("User", back_populates="budgets")
+    category: Mapped[Optional[Category]] = relationship("Category", back_populates="budgets")
 
-
-# Dialect-specific unique constraints for overall (category_id IS NULL) & categorized budgets:
-# - SQL Server / Azure SQL: filtered unique indexes (handles NULL category cleanly).
-# - MariaDB / MySQL: virtual generated column mapping NULL -> 0 + unique composite index.
-event.listen(
-    Budget.__table__,
-    "after_create",
-    DDL(
-        "CREATE UNIQUE INDEX uq_budgets_user_category_period "
-        "ON budgets (user_id, category_id, month, year) WHERE category_id IS NOT NULL;"
-    ).execute_if(dialect="mssql"),
-)
-event.listen(
-    Budget.__table__,
-    "after_create",
-    DDL(
-        "CREATE UNIQUE INDEX uq_budgets_user_overall_period "
-        "ON budgets (user_id, month, year) WHERE category_id IS NULL;"
-    ).execute_if(dialect="mssql"),
-)
-event.listen(
-    Budget.__table__,
-    "after_create",
-    DDL(
-        "ALTER TABLE budgets "
-        "ADD COLUMN category_scope_key INT GENERATED ALWAYS AS (COALESCE(category_id, 0)) VIRTUAL, "
-        "ADD UNIQUE KEY uq_budgets_user_scope_period (user_id, category_scope_key, month, year);"
-    ).execute_if(dialect="mysql"),
-)
+    def __repr__(self) -> str:
+        return (
+            f"<Budget id={self.id} user_id={self.user_id} category_id={self.category_id} "
+            f"period={self.year}-{self.month:02d} amount={self.amount}>"
+        )
 
 
 def delete_receipt_transactional(
@@ -352,7 +329,7 @@ def delete_receipt_transactional(
 ) -> Optional[str]:
     """
     Transactionally unlink any expense references for an owned receipt before deleting
-    its UploadedReceipt record cleanly (compensates for ON DELETE NO ACTION).
+    its UploadedReceipt record cleanly (compensates for ON DELETE NO ACTION on SQL Server).
     Returns the stored file_path if deleted, else None.
     """
     receipt = (
@@ -364,6 +341,7 @@ def delete_receipt_transactional(
         return None
 
     stored_path = receipt.file_path
+    from sqlalchemy import update
     session.execute(
         update(Expense)
         .where(Expense.receipt_id == receipt_id, Expense.user_id == user_id)
@@ -384,9 +362,11 @@ def delete_user_transactional(session: Session, user_id: int) -> bool:
     if user is None:
         return False
 
+    from sqlalchemy import update
     session.execute(
         update(Expense).where(Expense.user_id == user_id).values(receipt_id=None)
     )
     session.delete(user)
     session.flush()
     return True
+

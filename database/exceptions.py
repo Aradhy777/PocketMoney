@@ -149,11 +149,16 @@ def translate_db_exception(exc: Exception) -> DatabaseError:
             sqlstate=sqlstate,
         )
 
-    # 2. Integrity Violations (Unique, CHECK, Foreign Key, NOT NULL)
-    if isinstance(exc, IntegrityError) or code in (
-        1062, 1451, 1452, 1216, 1217, 4025, 3819, 1048,
-        2627, 2601, 547, 515,
-    ) or sqlstate == "23000":
+    # 2. Integrity Violations (Unique, CHECK, Foreign Key, NOT NULL, ENUM DataError 1265)
+    if (
+        isinstance(exc, IntegrityError)
+        or code in (
+            1062, 1451, 1452, 1216, 1217, 4025, 3819, 1048, 1265,
+            2627, 2601, 547, 515,
+        )
+        or sqlstate in ("23000", "01000", "22001")
+        or "data truncated for column" in lower_msg
+    ):
         if (
             code in (1062, 2627, 2601)
             or "duplicate" in lower_msg
@@ -166,9 +171,14 @@ def translate_db_exception(exc: Exception) -> DatabaseError:
                 sqlstate=sqlstate,
             )
 
-        if code in (4025, 3819) or "check constraint" in lower_msg or "chk_" in lower_msg:
+        if (
+            code in (4025, 3819, 1265)
+            or "check constraint" in lower_msg
+            or "chk_" in lower_msg
+            or "data truncated for column" in lower_msg
+        ):
             return CheckConstraintViolationError(
-                "Input value violates a database check constraint.",
+                "Input value violates a database check constraint or allowed enum values.",
                 backend=backend,
                 code=code,
                 sqlstate=sqlstate,

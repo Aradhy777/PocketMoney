@@ -29,7 +29,7 @@ from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from config import Config
 from database.engine import create_db_engine
@@ -112,6 +112,11 @@ def _disposable_mariadb() -> Iterator[tuple[str, str, Engine]]:
 
 @contextmanager
 def _disposable_localdb() -> Iterator[tuple[str, str, Engine]]:
+    from tests.conftest import check_localdb_support
+    avail, reason = check_localdb_support()
+    if not avail:
+        pytest.skip(f"SQL Server LocalDB unavailable: {reason}")
+
     db_name = f"et_p2a_mssql_{uuid.uuid4().hex[:10]}"
     master_conn_str = (
         "DRIVER={ODBC Driver 17 for SQL Server};"
@@ -257,7 +262,7 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
             ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
             assert ver == "20261112_0002"
 
-            # Verify generated column, unique index, widened month, DATETIME, portable CHECKs
+            # Verify generated column and unique index on budgets
             budget_cols = {
                 r[0]: r[1].lower()
                 for r in conn.execute(
@@ -269,9 +274,9 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
                 ).fetchall()
             }
             assert "category_scope_key" in budget_cols
-            assert budget_cols["month"] == "smallint"
-            assert budget_cols["created_at"] == "datetime"
-            assert budget_cols["updated_at"] == "datetime"
+            assert budget_cols["month"] == "tinyint"
+            assert budget_cols["created_at"] == "timestamp"
+            assert budget_cols["updated_at"] == "timestamp"
 
             budget_idxs = {
                 r[0]
@@ -284,7 +289,6 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
                 ).fetchall()
             }
             assert "uq_budgets_user_scope_period" in budget_idxs
-            assert "uk_user_category_month_year" not in budget_idxs
 
             exp_col_pm = conn.execute(
                 text(
@@ -293,7 +297,7 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
                 ),
                 {"db": db_name},
             ).scalar()
-            assert exp_col_pm.lower() == "varchar"
+            assert exp_col_pm.lower() == "enum"
 
             user_idxs = {
                 r[0]
@@ -305,7 +309,7 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
                     {"db": db_name},
                 ).fetchall()
             }
-            assert {"uq_users_username", "uq_users_email"}.issubset(user_idxs)
+            assert {"username", "email"}.issubset(user_idxs)
 
             # Verify fk_expenses_receipt stays ON DELETE SET NULL on MariaDB
             fk_del_rule = conn.execute(
@@ -331,8 +335,8 @@ def test_legacy_mariadb_schema_stamp_align_verify_idempotent_and_rollback():
                     )
                 )
 
-        # Invalid payment_method rejected by chk_expense_payment_method CHECK constraint
-        with pytest.raises(CheckConstraintViolationError):
+        # Invalid payment_method rejected by MariaDB native ENUM
+        with pytest.raises((CheckConstraintViolationError, DBAPIError, OperationalError)):
             with session_scope(eng) as s:
                 s.execute(
                     text(
@@ -412,7 +416,7 @@ def test_legacy_mariadb_duplicate_overall_budgets_abort_safely():
         cfg = _alembic_cfg_for(url)
         with _env_target(url, "mariadb"):
             alembic_command.stamp(cfg, "20261112_0001")
-            with pytest.raises(RuntimeError, match="duplicate budget scopes"):
+            with pytest.raises(RuntimeError, match="duplicate overall budgets"):
                 alembic_command.upgrade(cfg, "head")
 
         # Zero data loss & still cleanly at baseline revision

@@ -1,4 +1,5 @@
 """Align existing pre-Alembic MariaDB schema and verify cross-dialect parity
+"""Align MariaDB overall-budget uniqueness constraint safely
 
 Revision ID: 20261112_0002
 Revises: 20261112_0001
@@ -17,6 +18,7 @@ Purpose:
 - Preserve existing foreign key actions on MariaDB (including `fk_expenses_receipt`
   `ON DELETE SET NULL`), while remaining idempotent on fresh databases created by
   `20261112_0001` across both MariaDB and SQL Server / Azure SQL.
+Create Date: 2026-11-12 04:00:00
 """
 
 from __future__ import annotations
@@ -35,6 +37,11 @@ _OCR_STATUS_CHECK_SQL = "ocr_status IN ('pending', 'success', 'failed', 'fallbac
 _PAYMENT_METHOD_CHECK_SQL = (
     "payment_method IN ('UPI', 'Cash', 'Credit Card', 'Debit Card', 'Net Banking', 'Other')"
 )
+def _is_offline_mode() -> bool:
+    try:
+        return context.is_offline_mode()
+    except Exception:
+        return False
 
 _TIMESTAMP_TABLES = (
     ("users", "created_at", False),
@@ -82,26 +89,54 @@ def _mysql_get_check_constraints(conn, schema: str, table_name: str) -> set[str]
         {"schema": schema, "tbl": table_name},
     ).fetchall()
     return {r[0] for r in rows}
+def upgrade() -> None:
+    bind = op.get_bind()
+    dialect_name = bind.dialect.name
 
+    if _is_offline_mode():
+        if dialect_name == "mssql":
+            op.execute("-- Phase 2A budget uniqueness check (SQL Server already has filtered unique indexes: no-op)")
+        else:
+            op.execute("-- Phase 2A budget uniqueness alignment (MariaDB / MySQL)")
+        return
 
 def _mysql_validate_preconditions(conn) -> None:
     """Fail cleanly before altering schema if legacy data conflicts exist."""
     dup_budgets = conn.execute(
+    # On SQL Server: Migration 0001 already created filtered unique indexes
+    # (uq_budgets_user_category_period & uq_budgets_user_overall_period). No DDL required.
+    if dialect_name == "mssql":
+        return
+
+    # On MariaDB / MySQL:
+    # Safely address overall-budget uniqueness where category_id IS NULL without modifying
+    # ENUMs, timestamps, integer precision, or unrelated tables.
+    schema = bind.execute(sa.text("SELECT DATABASE()")).scalar()
+
+    # Pre-condition check: Ensure no duplicate overall budgets exist
+    dup_overall = bind.execute(
         sa.text(
             "SELECT user_id, COALESCE(category_id, 0) AS scope_key, month, year, COUNT(*) AS cnt "
+            "SELECT user_id, month, year, COUNT(*) AS cnt "
             "FROM budgets "
             "GROUP BY user_id, COALESCE(category_id, 0), month, year "
+            "WHERE category_id IS NULL "
+            "GROUP BY user_id, month, year "
             "HAVING COUNT(*) > 1"
         )
     ).fetchall()
     if dup_budgets:
+    if dup_overall:
         sample = ", ".join(
             f"(user={r[0]}, scope={r[1]}, month={r[2]}, year={r[3]}, count={r[4]})"
             for r in dup_budgets[:5]
+            f"(user={r[0]}, month={r[1]}, year={r[2]}, count={r[3]})"
+            for r in dup_overall[:5]
         )
         raise RuntimeError(
             "Cannot apply uq_budgets_user_scope_period while duplicate budget scopes exist: "
             + sample
+            f"Cannot apply overall budget uniqueness: duplicate overall budgets detected: {sample}"
         )
 
     bad_ocr = conn.execute(
@@ -114,6 +149,8 @@ def _mysql_validate_preconditions(conn) -> None:
         raise RuntimeError(
             f"Found {bad_ocr} uploaded_receipts row(s) with invalid ocr_status values."
         )
+    budget_cols = _mysql_get_columns(bind, schema, "budgets")
+    budget_idxs = _mysql_get_indexes(bind, schema, "budgets")
 
     bad_pm = conn.execute(
         sa.text(
@@ -136,11 +173,15 @@ def _upgrade_mysql_online(conn) -> None:
     budget_cols = _mysql_get_columns(conn, schema, "budgets")
     budget_idxs = _mysql_get_indexes(conn, schema, "budgets")
 
+    # In MySQL, categories.id is AUTO_INCREMENT primary key starting at 1.
+    # COALESCE(category_id, 0) maps NULL to 0 (Overall Budget), guaranteeing no collision
+    # with valid foreign-key category IDs (1, 2, ...).
     if "category_scope_key" not in budget_cols:
         op.execute(
             "ALTER TABLE budgets "
             "ADD COLUMN category_scope_key INT GENERATED ALWAYS AS (COALESCE(category_id, 0)) VIRTUAL"
         )
+
     if "uq_budgets_user_scope_period" not in budget_idxs:
         op.execute(
             "ALTER TABLE budgets "
@@ -374,6 +415,7 @@ def downgrade() -> None:
 
     if _is_offline_mode():
         op.execute("-- Phase 2A schema alignment downgrade")
+        op.execute("-- Phase 2A budget uniqueness downgrade")
         return
 
     if dialect_name == "mssql":
@@ -382,4 +424,12 @@ def downgrade() -> None:
         return
 
     _downgrade_mysql_online(bind)
+    schema = bind.execute(sa.text("SELECT DATABASE()")).scalar()
+    budget_cols = _mysql_get_columns(bind, schema, "budgets")
+    budget_idxs = _mysql_get_indexes(bind, schema, "budgets")
 
+    if "uq_budgets_user_scope_period" in budget_idxs:
+        op.execute("ALTER TABLE budgets DROP INDEX uq_budgets_user_scope_period")
+
+    if "category_scope_key" in budget_cols:
+        op.execute("ALTER TABLE budgets DROP COLUMN category_scope_key")
